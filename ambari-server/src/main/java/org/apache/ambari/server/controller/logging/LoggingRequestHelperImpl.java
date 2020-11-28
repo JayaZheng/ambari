@@ -156,6 +156,7 @@ public class LoggingRequestHelperImpl implements LoggingRequestHelper {
     this.logSearchReadTimeoutInMilliseconds = logSearchReadTimeoutInMilliseconds;
   }
 
+  @Override
   public LogQueryResponse sendQueryRequest(Map<String, String> queryParameters) {
     try {
       // use the Apache builder to create the correct URI
@@ -302,6 +303,7 @@ public class LoggingRequestHelperImpl implements LoggingRequestHelper {
     return null;
   }
 
+  @Override
   public HostLogFilesResponse sendGetLogFileNamesRequest(String hostName) {
     try {
       // use the Apache builder to create the correct URI
@@ -439,7 +441,7 @@ public class LoggingRequestHelperImpl implements LoggingRequestHelper {
     } else {
       uriBuilder.setScheme(scheme);
       uriBuilder.setHost(hostName);
-      uriBuilder.setPort(Integer.valueOf(portNumber));
+      uriBuilder.setPort(Integer.parseInt(portNumber));
     }
     return uriBuilder;
   }

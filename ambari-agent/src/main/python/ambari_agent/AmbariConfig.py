@@ -24,6 +24,7 @@ import StringIO
 import hostname
 import ambari_simplejson as json
 import os
+import ssl
 
 from ambari_agent.FileCache import FileCache
 from ambari_commons.os_family_impl import OsFamilyFuncImpl, OsFamilyImpl
@@ -82,12 +83,22 @@ log_command_executes = 0
 
 class AmbariConfig:
   TWO_WAY_SSL_PROPERTY = "security.server.two_way_ssl"
+  COMMAND_FILE_RETENTION_POLICY_PROPERTY = 'command_file_retention_policy'
   AMBARI_PROPERTIES_CATEGORY = 'agentConfig'
   SERVER_CONNECTION_INFO = "{0}/connection_info"
   CONNECTION_PROTOCOL = "https"
 
   # linux open-file limit
   ULIMIT_OPEN_FILES_KEY = 'ulimit.open.files'
+
+  # #### Command JSON file retention policies #####
+  # Keep all command-*.json files
+  COMMAND_FILE_RETENTION_POLICY_KEEP = 'keep'
+  # Remove command-*.json files if the operation was successful
+  COMMAND_FILE_RETENTION_POLICY_REMOVE_ON_SUCCESS = 'remove_on_success'
+  # Remove all command-*.json files when no longer needed
+  COMMAND_FILE_RETENTION_POLICY_REMOVE = 'remove'
+  # #### Command JSON file retention policies (end) #####
 
   config = None
   net = None
@@ -100,8 +111,8 @@ class AmbariConfig:
   def get(self, section, value, default=None):
     try:
       return str(self.config.get(section, value)).strip()
-    except ConfigParser.Error, err:
-      if default != None:
+    except ConfigParser.Error as err:
+      if default is not None:
         return default
       raise err
 
@@ -210,6 +221,45 @@ class AmbariConfig:
   @property
   def host_scripts_dir(self):
     return os.path.join(self.cache_dir, FileCache.HOST_SCRIPTS_CACHE_DIRECTORY)
+
+  @property
+  def command_file_retention_policy(self):
+    """
+    Returns the Agent's command file retention policy.  This policy indicates what to do with the
+    command-*.json and status_command.json files after they are done being used to execute commands
+    from the Ambari server.
+
+    Possible policy values are:
+
+    * keep - Keep all command-*.json files
+    * remove - Remove all command-*.json files when no longer needed
+    * remove_on_success - Remove command-*.json files if the operation was successful
+
+    The policy value is expected to be set in the Ambari agent's ambari-agent.ini file, under the
+    [agent] section.
+
+    For example:
+        command_file_retention_policy=remove
+
+    However, if the value is not set, or set to an unexpected value, "keep" will be returned, since
+    this has been the (only) policy for past versions.
+
+    :rtype: string
+    :return: the command file retention policy, either "keep", "remove", or "remove_on_success"
+    """
+    policy = self.get('agent', self.COMMAND_FILE_RETENTION_POLICY_PROPERTY, default=self.COMMAND_FILE_RETENTION_POLICY_KEEP)
+    policies = [self.COMMAND_FILE_RETENTION_POLICY_KEEP,
+                self.COMMAND_FILE_RETENTION_POLICY_REMOVE,
+                self.COMMAND_FILE_RETENTION_POLICY_REMOVE_ON_SUCCESS]
+
+    if policy.lower() in policies:
+      return policy.lower()
+    else:
+      logger.warning('The configured command_file_retention_policy is invalid, returning "%s" instead: %s',
+                     self.COMMAND_FILE_RETENTION_POLICY_KEEP,
+                     policy)
+      return self.COMMAND_FILE_RETENTION_POLICY_KEEP
+
 
   # TODO AMBARI-18733, change usages of this function to provide the home_dir.
   @staticmethod
@@ -327,7 +377,8 @@ class AmbariConfig:
 
     :return: protocol name, PROTOCOL_TLSv1_2 by default
     """
-    return self.get('security', 'force_https_protocol', default="PROTOCOL_TLSv1_2")
+    default = "PROTOCOL_TLSv1_2" if hasattr(ssl, "PROTOCOL_TLSv1_2") else "PROTOCOL_TLSv1"
+    return self.get('security', 'force_https_protocol', default=default)
 
   def get_force_https_protocol_value(self):
     """
@@ -335,7 +386,6 @@ class AmbariConfig:
 
     :return: protocol value
     """
-    import ssl
     return getattr(ssl, self.get_force_https_protocol_name())
 
   def get_ca_cert_file_path(self):

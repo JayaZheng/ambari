@@ -67,7 +67,7 @@ App.UpdateController = Em.Controller.extend({
              "host_components/metrics/hbase/master/MasterStartTime," +
              "host_components/metrics/hbase/master/MasterActiveTime," +
              "host_components/metrics/hbase/master/AverageLoad," +
-             "host_components/metrics/master/AssignmentManger/ritCount",
+             "host_components/metrics/master/AssignmentManager/ritCount",
     'STORM': 'metrics/api/v1/cluster/summary,metrics/api/v1/topology/summary,metrics/api/v1/nimbus/summary',
     'HDFS': 'host_components/metrics/dfs/namenode/ClusterId'
   },
@@ -685,10 +685,11 @@ App.UpdateController = Em.Controller.extend({
   },
 
   configsChangedHandler: function(event) {
-    if (event.configs && event.configs.someProperty('type', 'cluster-env')) {
-      this.updateClusterEnv();
-    }
-    App.router.get('configurationController').updateConfigTags();
+    App.router.get('configurationController').updateConfigTags().always(() => {
+      if (event.configs && event.configs.someProperty('type', 'cluster-env')) {
+        this.updateClusterEnv();
+      }
+    });
   },
 
   //TODO - update service auto-start to use this

@@ -75,9 +75,24 @@ App.FileSystem = Ember.ObjectProxy.extend({
   content: null,
   services: [],
 
+  //special case for HDFS and OZONE. They can be selected together
+  shouldAllSelectionBeCleared: function () {
+    const dfsNames = this.get('services').mapProperty('serviceName');
+    const coExistingDfs = ['HDFS', 'OZONE'],
+      selectedServices = this.get('services').filterProperty('isSelected');
+    for (let i = 0; i < selectedServices.length; i++) {
+      if (!coExistingDfs.includes(selectedServices[i].get('serviceName'))) {
+        return true;
+      }
+    }
+    return !(dfsNames.includes('HDFS') && dfsNames.includes('OZONE') && coExistingDfs.includes(this.get('content.serviceName')));
+  },
+
   isSelected: function(key, aBoolean) {
     if (arguments.length > 1) {
-      this.clearAllSelection();
+      if (this.shouldAllSelectionBeCleared()) {
+        this.clearAllSelection();
+      }
       this.get('content').set('isSelected', aBoolean);
     }
     return this.get('content.isSelected');
@@ -206,9 +221,8 @@ App.StackService = DS.Model.extend({
   }.property('coSelectedServices', 'serviceName'),
 
   isHiddenOnSelectServicePage: function () {
-    var hiddenServices = ['MAPREDUCE2'];
-    return hiddenServices.contains(this.get('serviceName')) || !this.get('isInstallable') || this.get('doNotShowAndInstall');
-  }.property('serviceName', 'isInstallable'),
+    return !this.get('isInstallable') || this.get('doNotShowAndInstall');
+  }.property('isInstallable', 'doNotShowAndInstall'),
 
   doNotShowAndInstall: function () {
     var skipServices = [];
@@ -336,9 +350,7 @@ App.StackService.componentsOrderForService = {
 };
 
 //@TODO: Write unit test for no two keys in the object should have any intersecting elements in their values
-App.StackService.coSelected = {
-  'YARN': ['MAPREDUCE2']
-};
+App.StackService.coSelected = {};
 
 
 App.StackService.reviewPageHandlers = {
@@ -477,8 +489,7 @@ App.StackService.configCategories = function () {
         App.ServiceConfigCategory.create({ name: 'UnixAuthenticationSettings', displayName: 'Unix Authentication Settings'}),
         App.ServiceConfigCategory.create({ name: 'ADSettings', displayName: 'AD Settings'}),
         App.ServiceConfigCategory.create({ name: 'LDAPSettings', displayName: 'LDAP Settings'}),
-        App.ServiceConfigCategory.create({ name: 'KnoxSSOSettings', displayName: 'Knox SSO Settings'}),
-        App.ServiceConfigCategory.create({ name: 'SolrKerberosSettings', displayName: 'Solr Kerberos Settings'})
+        App.ServiceConfigCategory.create({ name: 'KnoxSSOSettings', displayName: 'Knox SSO Settings'})
       ]);
       break;
     case 'ACCUMULO':

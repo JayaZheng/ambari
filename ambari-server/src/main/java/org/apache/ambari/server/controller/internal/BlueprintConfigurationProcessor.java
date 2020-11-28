@@ -40,6 +40,9 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import javax.annotation.Nullable;
+import javax.validation.constraints.NotNull;
+
 import org.apache.ambari.server.AmbariException;
 import org.apache.ambari.server.state.Cluster;
 import org.apache.ambari.server.state.ConfigHelper;
@@ -54,14 +57,18 @@ import org.apache.ambari.server.topology.ConfigRecommendationStrategy;
 import org.apache.ambari.server.topology.Configuration;
 import org.apache.ambari.server.topology.HostGroup;
 import org.apache.ambari.server.topology.HostGroupInfo;
+import org.apache.ambari.server.topology.InvalidTopologyException;
+import org.apache.ambari.server.topology.validators.NameNodeHaValidator;
 import org.apache.ambari.server.topology.validators.UnitValidatedProperty;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -117,36 +124,37 @@ public class BlueprintConfigurationProcessor {
 
   private final static String HADOOP_ENV_CONFIG_TYPE_NAME = "hadoop-env";
   private final static String RANGER_TAGSYNC_SITE_CONFIG_TYPE_NAME = "ranger-tagsync-site";
+  private static final String LOCALHOST = "localhost";
 
 
   /**
    * Single host topology updaters
    */
-  protected static Map<String, Map<String, PropertyUpdater>> singleHostTopologyUpdaters =
+  protected static final Map<String, Map<String, PropertyUpdater>> singleHostTopologyUpdaters =
     new HashMap<>();
 
   /**
    * Multi host topology updaters
    */
-  private static Map<String, Map<String, PropertyUpdater>> multiHostTopologyUpdaters =
+  private static final Map<String, Map<String, PropertyUpdater>> multiHostTopologyUpdaters =
     new HashMap<>();
 
   /**
    * Database host topology updaters
    */
-  private static Map<String, Map<String, PropertyUpdater>> dbHostTopologyUpdaters =
+  private static final Map<String, Map<String, PropertyUpdater>> dbHostTopologyUpdaters =
     new HashMap<>();
 
   /**
    * Updaters for properties which need 'm' appended
    */
-  private static Map<String, Map<String, PropertyUpdater>> mPropertyUpdaters =
+  private static final Map<String, Map<String, PropertyUpdater>> mPropertyUpdaters =
     new HashMap<>();
 
   /**
    * Non topology related updaters
    */
-  private static Map<String, Map<String, PropertyUpdater>> nonTopologyUpdaters =
+  private static final Map<String, Map<String, PropertyUpdater>> nonTopologyUpdaters =
     new HashMap<>();
 
   /**
@@ -155,24 +163,24 @@ public class BlueprintConfigurationProcessor {
    * removed from export, but do not require an update during
    * cluster creation
    */
-  private Map<String, Map<String, PropertyUpdater>> removePropertyUpdaters =
+  private final Map<String, Map<String, PropertyUpdater>> removePropertyUpdaters =
     new HashMap<>();
 
   /**
    * Collection of all updaters
    */
-  private static Collection<Map<String, Map<String, PropertyUpdater>>> allUpdaters =
+  private static final Collection<Map<String, Map<String, PropertyUpdater>>> allUpdaters =
     new ArrayList<>();
 
   /**
    * Compiled regex for hostgroup token with port information.
    */
-  private static Pattern HOSTGROUP_PORT_REGEX = Pattern.compile("%HOSTGROUP::(\\S+?)%:?(\\d+)?");
+  private static final Pattern HOSTGROUP_PORT_REGEX = Pattern.compile("%HOSTGROUP::(\\S+?)%:?(\\d+)?");
 
   /**
    * Compiled regex for hostgroup token with port information.
    */
-  private static Pattern LOCALHOST_PORT_REGEX = Pattern.compile("localhost:?(\\d+)?");
+  private static final Pattern LOCALHOST_PORT_REGEX = Pattern.compile("localhost:?(\\d+)?");
 
   /**
    * Compiled regex for placeholder
@@ -182,7 +190,7 @@ public class BlueprintConfigurationProcessor {
   /**
    * Special network address
    */
-  private static String BIND_ALL_IP_ADDRESS = "0.0.0.0";
+  private static final String BIND_ALL_IP_ADDRESS = "0.0.0.0";
 
   /**
    * Statically-defined set of properties that can support HA using a nameservice name
@@ -190,15 +198,25 @@ public class BlueprintConfigurationProcessor {
    *   This set also contains other HA properties that will be exported if the
    *   expected hostname information is not found.
    */
-  private static Set<String> configPropertiesWithHASupport =
+  private static final Set<String> configPropertiesWithHASupport =
     new HashSet<>(Arrays.asList("fs.defaultFS", "hbase.rootdir", "instance.volumes", "policymgr_external_url", "xasecure.audit.destination.hdfs.dir"));
+
+  private static final Set<Pair<String, String>> PROPERTIES_FOR_HADOOP_PROXYUSER = ImmutableSet.of(
+    Pair.of("oozie-env", "oozie_user"),
+    Pair.of("hive-env", "hive_user"),
+    Pair.of("hive-env", "webhcat_user"),
+    Pair.of("hbase-env", "hbase_user"),
+    Pair.of("falcon-env", "falcon_user")
+  );
+  private static final String HADOOP_PROXYUSER_HOSTS_FORMAT = "hadoop.proxyuser.%s.hosts";
+  private static final String HADOOP_PROXYUSER_GROUPS_FORMAT = "hadoop.proxyuser.%s.groups";
 
   /**
    * Statically-defined list of filters to apply on property exports.
    * This will initially be used to filter out the Ranger Passwords, but
    * could be extended in the future for more generic purposes.
    */
-  private PropertyFilter[] getExportPropertyFilters (Map<Long, Set<String>> authToLocalPerClusterMap)
+  private PropertyFilter[] getExportPropertyFilters(Map<Long, Set<String>> authToLocalPerClusterMap)
   {
     return new PropertyFilter[] {
       new PasswordPropertyFilter(),
@@ -274,8 +292,6 @@ public class BlueprintConfigurationProcessor {
       oozieEnvUpdaters.put("oozie_existing_mysql_host", new SingleHostTopologyUpdater("OOZIE_SERVER"));
       oozieEnvUpdaters.put("oozie_existing_oracle_host", new SingleHostTopologyUpdater("OOZIE_SERVER"));
       oozieEnvUpdaters.put("oozie_existing_postgresql_host", new SingleHostTopologyUpdater("OOZIE_SERVER"));
-      oozieEnvUpdaters.put("oozie_existing_oracle_host", new SingleHostTopologyUpdater("OOZIE_SERVER"));
-      oozieEnvUpdaters.put("oozie_existing_postgresql_host", new SingleHostTopologyUpdater("OOZIE_SERVER"));
       oozieSiteUpdaters.put("oozie.service.JPAService.jdbc.url",  new SingleHostTopologyUpdater("OOZIE_SERVER"));
 
       singleHostTopologyUpdaters.put("oozie-env", oozieEnvUpdaters);
@@ -285,8 +301,6 @@ public class BlueprintConfigurationProcessor {
       Map<String, PropertyUpdater> oozieSiteOriginalValueMap = new HashMap<>();
       // register updaters for Oozie properties that may point to an external DB
       oozieEnvOriginalValueMap.put("oozie_existing_mysql_host", new OriginalValuePropertyUpdater());
-      oozieEnvOriginalValueMap.put("oozie_existing_oracle_host", new OriginalValuePropertyUpdater());
-      oozieEnvOriginalValueMap.put("oozie_existing_postgresql_host", new OriginalValuePropertyUpdater());
       oozieEnvOriginalValueMap.put("oozie_existing_oracle_host", new OriginalValuePropertyUpdater());
       oozieEnvOriginalValueMap.put("oozie_existing_postgresql_host", new OriginalValuePropertyUpdater());
       oozieSiteOriginalValueMap.put("oozie.service.JPAService.jdbc.url", new OriginalValuePropertyUpdater());
@@ -448,9 +462,8 @@ public class BlueprintConfigurationProcessor {
     }
 
     // Explicitly set any properties that are required but not currently provided in the stack definition.
+    injectDefaults(clusterConfig, configTypesUpdated, clusterTopology.getBlueprint().getServices());
     setStackToolsAndFeatures(clusterConfig, configTypesUpdated);
-    setRetryConfiguration(clusterConfig, configTypesUpdated);
-    setupHDFSProxyUsers(clusterConfig, configTypesUpdated);
     addExcludedConfigProperties(clusterConfig, configTypesUpdated, clusterTopology.getBlueprint().getStack());
 
     trimProperties(clusterConfig, clusterTopology);
@@ -465,6 +478,23 @@ public class BlueprintConfigurationProcessor {
   private void doNameNodeHAUpdateOnClusterCreation(Configuration clusterConfig,
                                                    Map<String, Map<String, String>> clusterProps,
                                                    Set<String> configTypesUpdated) throws ConfigurationTopologyException {
+
+    final Collection<String> nnHosts = clusterTopology.getHostAssignmentsForComponent("NAMENODE");
+
+    // external namenodes
+    if (nnHosts.isEmpty()) {
+      LOG.info("NAMENODE HA is enabled but there are no NAMENODE components in the cluster. Assuming external name nodes.");
+      // need to redo validation here as required information (explicit hostnames for some host groups) may have been
+      // missing by the time the ClusterTopology object was validated
+      try {
+        new NameNodeHaValidator().validateExternalNamenodeHa(clusterTopology);
+      }
+      catch (InvalidTopologyException ex) {
+        throw new ConfigurationTopologyException(ex.getMessage(), ex);
+      }
+      return;
+    }
+
     // add "dfs.internal.nameservices" if it's not specified
     Map<String, String> hdfsSiteConfig = clusterConfig.getFullProperties().get("hdfs-site");
     String nameservices = hdfsSiteConfig.get("dfs.nameservices");
@@ -481,10 +511,9 @@ public class BlueprintConfigurationProcessor {
       LOG.info("Processing a single HDFS NameService, which indicates a default HDFS NameNode HA deployment");
       // if the active/standby namenodes are not specified, assign them automatically
       if (! isNameNodeHAInitialActiveNodeSet(clusterProps) && ! isNameNodeHAInitialStandbyNodeSet(clusterProps)) {
-        Collection<String> nnHosts = clusterTopology.getHostAssignmentsForComponent("NAMENODE");
-        if (nnHosts.size() < 2) {
-          throw new ConfigurationTopologyException("NAMENODE HA requires at least 2 hosts running NAMENODE but there are: " +
-            nnHosts.size() + " Hosts: " + nnHosts);
+        if (nnHosts.size() == 1) { // can't be 0 as in that case was handled above
+          throw new ConfigurationTopologyException("NAMENODE HA requires at least two hosts running NAMENODE but there is " +
+            "only one: " + nnHosts.iterator().next());
         }
 
         // set the properties that configure which namenode is active,
@@ -812,7 +841,7 @@ public class BlueprintConfigurationProcessor {
    * Update properties for blueprint export.
    * This involves converting concrete topology information to host groups.
    */
-  public void doUpdateForBlueprintExport() {
+  public void doUpdateForBlueprintExport(BlueprintExportType exportType) {
     // HA configs are only processed in cluster configuration, not HG configurations
     if (clusterTopology.isNameNodeHAEnabled()) {
       doNameNodeHAUpdate();
@@ -827,7 +856,8 @@ public class BlueprintConfigurationProcessor {
     }
 
     Collection<Configuration> allConfigs = new ArrayList<>();
-    allConfigs.add(clusterTopology.getConfiguration());
+    Configuration clusterConfig = clusterTopology.getConfiguration();
+    allConfigs.add(clusterConfig);
     for (HostGroupInfo groupInfo : clusterTopology.getHostGroupInfo().values()) {
       Configuration hgConfiguration = groupInfo.getConfiguration();
       if (! hgConfiguration.getFullProperties(1).isEmpty()) {
@@ -849,6 +879,20 @@ public class BlueprintConfigurationProcessor {
 
       doFilterPriorToExport(configuration);
     }
+
+    Blueprint blueprint = clusterTopology.getBlueprint();
+    applyTypeSpecificFilter(exportType, clusterConfig, blueprint.getStack().getConfiguration(), blueprint.getServices());
+  }
+
+  @VisibleForTesting
+  void applyTypeSpecificFilter(BlueprintExportType exportType, Configuration clusterConfig, Configuration stackConfig, Collection<String> services) {
+    if (exportType == BlueprintExportType.MINIMAL) {
+      // convert back to suffix-less form, to allow comparing to defaults
+      doNonTopologyUpdate(mPropertyUpdaters, clusterConfig);
+    }
+
+    injectDefaults(stackConfig, new HashSet<>(), services);
+    exportType.filter(clusterConfig, stackConfig);
   }
 
   /**
@@ -974,6 +1018,8 @@ public class BlueprintConfigurationProcessor {
       }
     }
   }
+
+
 
   /**
    * Update configuration properties based on advised configuration properties.
@@ -1670,11 +1716,11 @@ public class BlueprintConfigurationProcessor {
     for (Map.Entry<String, Map<String, PropertyUpdater>> entry : updaters.entrySet()) {
       String type = entry.getKey();
       for (String propertyName : entry.getValue().keySet()) {
-        NonTopologyUpdater npu = (NonTopologyUpdater) entry.getValue().get(propertyName);
+        PropertyUpdater pu = entry.getValue().get(propertyName);
         Map<String, String> typeProperties = properties.get(type);
 
         if (typeProperties != null && typeProperties.containsKey(propertyName)) {
-          String newValue = npu.updateForBlueprintExport(propertyName, typeProperties.get(propertyName), properties, clusterTopology);
+          String newValue = pu.updateForBlueprintExport(propertyName, typeProperties.get(propertyName), properties, clusterTopology);
           configuration.setProperty(type, propertyName, newValue);
         }
       }
@@ -1699,6 +1745,10 @@ public class BlueprintConfigurationProcessor {
                                   String origValue,
                                   Map<String, Map<String, String>> properties,
                                   ClusterTopology topology);
+
+    default String updateForBlueprintExport(String propertyName, String value, Map<String, Map<String, String>> properties, ClusterTopology topology) {
+      return value;
+    }
 
     /**
      * Determine the required host groups for the provided property.
@@ -1733,6 +1783,11 @@ public class BlueprintConfigurationProcessor {
                                          String origValue,
                                          Map<String, Map<String, String>> properties,
                                          ClusterTopology topology) {
+
+      if (origValue == null) {
+        LOG.info("Property {} is null, skipping search for host group placeholder", propertyName);
+        return null;
+      }
 
       HostGroups hostGroups = new HostGroups(topology, propertyName);
 
@@ -1774,6 +1829,11 @@ public class BlueprintConfigurationProcessor {
                                                     String origValue,
                                                     Map<String, Map<String, String>> properties,
                                                     ClusterTopology topology) {
+      if (origValue == null) {
+        LOG.info("Property {} is null, skipping search for host group placeholder", propertyName);
+        return Collections.emptyList();
+      }
+
       //todo: getHostStrings
       Matcher m = HostGroup.HOSTGROUP_REGEX.matcher(origValue);
       Set<String> hostGroups = new HashSet<>();
@@ -1844,14 +1904,20 @@ public class BlueprintConfigurationProcessor {
                                          ClusterTopology topology) {
 
       String replacedValue = super.updateForClusterCreate(propertyName, origValue, properties, topology);
+      // %HOSTGROUP% token replacement happened
       if (!Objects.equals(origValue, replacedValue)) {
         return replacedValue;
-      } else {
+      }
+      // localhost typically means stack default values. If property is set to a concrete value such as an FQDN skip
+      // validation and update
+      else if (null != origValue && !origValue.contains(LOCALHOST)) {
+        return origValue;
+      }
+      else {
         int matchingGroupCount = topology.getHostGroupsForComponent(component).size();
         if (matchingGroupCount == 1) {
           //todo: warn if > 1 hosts
-          return replacePropertyValue(origValue,
-            topology.getHostAssignmentsForComponent(component).iterator().next(), properties);
+          return origValue.replace(LOCALHOST, topology.getHostAssignmentsForComponent(component).iterator().next() );
         } else {
           //todo: extract all hard coded HA logic
           Cardinality cardinality = topology.getBlueprint().getStack().getCardinality(component);
@@ -1881,59 +1947,11 @@ public class BlueprintConfigurationProcessor {
                 // reference must point to the logical nameservice, rather than an individual namenode
                 return origValue;
               }
-
-              if (!origValue.contains("localhost")) {
-                // if this NameNode HA property is a FDQN, then simply return it
-                return origValue;
-              }
-
             }
 
             if (topology.isNameNodeHAEnabled() && isComponentSecondaryNameNode() && (matchingGroupCount == 0)) {
               // if HDFS HA is enabled, then no replacement is necessary for properties that refer to the SECONDARY_NAMENODE
               // eventually this type of information should be encoded in the stacks
-              return origValue;
-            }
-
-            if (topology.isYarnResourceManagerHAEnabled() && isComponentResourceManager() && (matchingGroupCount == 2)) {
-              if (!origValue.contains("localhost")) {
-                // if this Yarn property is a FQDN, then simply return it
-                return origValue;
-              }
-            }
-
-            if ((isOozieServerHAEnabled(properties)) && isComponentOozieServer() && (matchingGroupCount > 1)) {
-              if (!origValue.contains("localhost")) {
-                // if this Oozie property is a FQDN, then simply return it
-                return origValue;
-              }
-            }
-
-            if ((isHiveServerHAEnabled(properties)) && isComponentHiveServer() && (matchingGroupCount > 1)) {
-              if (!origValue.contains("localhost")) {
-                // if this Hive property is a FQDN, then simply return it
-                return origValue;
-              }
-            }
-
-            if ((isComponentHiveMetaStoreServer()) && matchingGroupCount > 1) {
-              if (!origValue.contains("localhost")) {
-                // if this Hive MetaStore property is a FQDN, then simply return it
-                return origValue;
-              }
-            }
-
-            if (isRangerAdmin() && matchingGroupCount > 1) {
-              if (origValue != null && !origValue.contains("localhost")) {
-                // if this Ranger admin property is a FQDN then simply return it
-                return origValue;
-              }
-            }
-
-            if ((isComponentAppTimelineServer() || isComponentHistoryServer()) &&
-              (matchingGroupCount > 1 && origValue != null && !origValue.contains("localhost"))) {
-              // in case of multiple component instances of AppTimelineServer or History Server leave custom value
-              // if set
               return origValue;
             }
 
@@ -1943,14 +1961,10 @@ public class BlueprintConfigurationProcessor {
 
             throw new IllegalArgumentException(
               String.format("Unable to update configuration property '%s' with topology information. " +
-                "Component '%s' is mapped to an invalid number of hosts '%s'.", propertyName, component, matchingGroupCount));
+                "Component '%s' is mapped to an invalid number of host groups '%s'.", propertyName, component, matchingGroupCount));
           }
         }
       }
-    }
-
-    public String replacePropertyValue(String origValue, String host, Map<String, Map<String, String>> properties) {
-      return origValue.replace("localhost", host);
     }
 
     @Override
@@ -2104,7 +2118,12 @@ public class BlueprintConfigurationProcessor {
    * This updater detects the case when the specified component
    * is not found, and returns the original property value.
    *
+   * @deprecated {@link SingleHostTopologyUpdater} has been changed not to validate explicitly set (other than
+   *   the typically stack default {@code localhost}) values. The new semantics make this class obsolete. If you want to
+   *   submit a cluster with some intentionally missing components, set respective properties to a value other than the
+   *   stack default {@code localhost} (e.g it can be empty string or and FQDN).
    */
+  @Deprecated
   private static class OptionalSingleHostTopologyUpdater extends SingleHostTopologyUpdater {
 
     public OptionalSingleHostTopologyUpdater(String component) {
@@ -2119,6 +2138,8 @@ public class BlueprintConfigurationProcessor {
       try {
         return super.updateForClusterCreate(propertyName, origValue, properties, topology);
       } catch (IllegalArgumentException illegalArgumentException) {
+        LOG.warn("Error while updating property [{}] with original value [{}]. Exception message: {}",
+          propertyName, origValue, illegalArgumentException.getMessage());
         // return the original value, since the optional component is not available in this cluster
         return origValue;
       }
@@ -2288,9 +2309,7 @@ public class BlueprintConfigurationProcessor {
                                          Map<String, Map<String, String>> properties,
                                          ClusterTopology topology) {
 
-      StringBuilder sb = new StringBuilder();
-
-      if (!origValue.contains("%HOSTGROUP") && (!origValue.contains("localhost"))) {
+      if (!origValue.contains("%HOSTGROUP") && (!origValue.contains(LOCALHOST))) {
         // this property must contain FQDNs specified directly by the user
         // of the Blueprint, so the processor should not attempt to update them
         return origValue;
@@ -2379,7 +2398,7 @@ public class BlueprintConfigurationProcessor {
      */
     private Collection<String> getHostStringsFromLocalhost(String origValue, ClusterTopology topology) {
       Set<String> hostStrings = new HashSet<>();
-      if(origValue.contains("localhost")) {
+      if(origValue.contains(LOCALHOST)) {
         Matcher localhostMatcher = LOCALHOST_PORT_REGEX.matcher(origValue);
         String port = null;
         if(localhostMatcher.find()) {
@@ -2546,7 +2565,7 @@ public class BlueprintConfigurationProcessor {
      */
     public boolean isFQDNValue(String value) {
       return !value.contains("%HOSTGROUP") &&
-        !value.contains("localhost");
+        !value.contains(LOCALHOST);
     }
   }
 
@@ -2688,7 +2707,7 @@ public class BlueprintConfigurationProcessor {
 
       // short-circuit out any custom property values defined by the deployer
       if (!origValue.contains("%HOSTGROUP") &&
-        (!origValue.contains("localhost"))) {
+        (!origValue.contains(LOCALHOST))) {
         // this property must contain FQDNs specified directly by the user
         // of the Blueprint, so the processor should not attempt to update them
         return origValue;
@@ -2731,7 +2750,7 @@ public class BlueprintConfigurationProcessor {
 
       // short-circuit out any custom property values defined by the deployer
       if (!origValue.contains("%HOSTGROUP") &&
-        (!origValue.contains("localhost"))) {
+        (!origValue.contains(LOCALHOST))) {
         // this property must contain FQDNs specified directly by the user
         // of the Blueprint, so the processor should not attempt to update them
         return Collections.emptySet();
@@ -2762,13 +2781,6 @@ public class BlueprintConfigurationProcessor {
                                                     Map<String, Map<String, String>> properties,
                                                     ClusterTopology topology) {
       return Collections.emptyList();
-    }
-
-    public String updateForBlueprintExport(String propertyName,
-                                           String origValue,
-                                           Map<String, Map<String, String>> properties,
-                                           ClusterTopology topology) {
-      return origValue;
     }
   }
 
@@ -2813,6 +2825,7 @@ public class BlueprintConfigurationProcessor {
     Map<String, PropertyUpdater> oozieEnvHeapSizeMap = new HashMap<>();
     Map<String, PropertyUpdater> multiWebhcatSiteMap = new HashMap<>();
     Map<String, PropertyUpdater> multiHbaseSiteMap = new HashMap<>();
+    Map<String, PropertyUpdater> livy2Conf = new HashMap<>();
     Map<String, PropertyUpdater> multiStormSiteMap = new HashMap<>();
     Map<String, PropertyUpdater> multiCoreSiteMap = new HashMap<>();
     Map<String, PropertyUpdater> multiHdfsSiteMap = new HashMap<>();
@@ -2851,7 +2864,6 @@ public class BlueprintConfigurationProcessor {
     singleHostTopologyUpdaters.put("hive-env", hiveEnvMap);
     singleHostTopologyUpdaters.put("oozie-env", oozieEnvMap);
     singleHostTopologyUpdaters.put("kafka-broker", kafkaBrokerMap);
-    singleHostTopologyUpdaters.put("application-properties", atlasPropsMap);
     singleHostTopologyUpdaters.put("admin-properties", rangerAdminPropsMap);
     singleHostTopologyUpdaters.put("ranger-env", rangerEnvPropsMap);
     singleHostTopologyUpdaters.put("ranger-yarn-audit", rangerYarnAuditPropsMap);
@@ -2886,6 +2898,8 @@ public class BlueprintConfigurationProcessor {
     multiHostTopologyUpdaters.put("oozie-site", multiOozieSiteMap);
     multiHostTopologyUpdaters.put("accumulo-site", multiAccumuloSiteMap);
     multiHostTopologyUpdaters.put("kms-site", multiRangerKmsSiteMap);
+    multiHostTopologyUpdaters.put("application-properties", atlasPropsMap);
+    multiHostTopologyUpdaters.put("livy2-conf", livy2Conf);
 
     dbHostTopologyUpdaters.put("hive-site", dbHiveSiteMap);
 
@@ -2898,14 +2912,14 @@ public class BlueprintConfigurationProcessor {
 
 
     // NAMENODE
-    hdfsSiteMap.put("dfs.http.address", new SingleHostTopologyUpdater("NAMENODE"));
-    hdfsSiteMap.put("dfs.https.address", new SingleHostTopologyUpdater("NAMENODE"));
-    coreSiteMap.put("fs.default.name", new SingleHostTopologyUpdater("NAMENODE"));
-    hdfsSiteMap.put("dfs.namenode.http-address", new SingleHostTopologyUpdater("NAMENODE"));
-    hdfsSiteMap.put("dfs.namenode.https-address", new SingleHostTopologyUpdater("NAMENODE"));
-    hdfsSiteMap.put("dfs.namenode.rpc-address", new SingleHostTopologyUpdater("NAMENODE"));
-    coreSiteMap.put("fs.defaultFS", new SingleHostTopologyUpdater("NAMENODE"));
-    hbaseSiteMap.put("hbase.rootdir", new SingleHostTopologyUpdater("NAMENODE"));
+    hdfsSiteMap.put("dfs.http.address", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    hdfsSiteMap.put("dfs.https.address", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    coreSiteMap.put("fs.default.name", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    hdfsSiteMap.put("dfs.namenode.http-address", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    hdfsSiteMap.put("dfs.namenode.https-address", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    hdfsSiteMap.put("dfs.namenode.rpc-address", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    coreSiteMap.put("fs.defaultFS", new OptionalSingleHostTopologyUpdater("NAMENODE"));
+    hbaseSiteMap.put("hbase.rootdir", new OptionalSingleHostTopologyUpdater("NAMENODE"));
     accumuloSiteMap.put("instance.volumes", new SingleHostTopologyUpdater("NAMENODE"));
     // HDFS shared.edits JournalNode Quorum URL uses semi-colons as separators
     multiHdfsSiteMap.put("dfs.namenode.shared.edits.dir", new MultipleHostTopologyUpdater("JOURNALNODE", ';', false, false, true));
@@ -2915,8 +2929,8 @@ public class BlueprintConfigurationProcessor {
     clusterEnvMap.put(HDFS_STANDBY_NAMENODE_PROPERTY_NAME, new SingleHostTopologyUpdater("NAMENODE"));
 
     // SECONDARY_NAMENODE
-    hdfsSiteMap.put("dfs.secondary.http.address", new SingleHostTopologyUpdater("SECONDARY_NAMENODE"));
-    hdfsSiteMap.put("dfs.namenode.secondary.http-address", new SingleHostTopologyUpdater("SECONDARY_NAMENODE"));
+    hdfsSiteMap.put("dfs.secondary.http.address", new OptionalSingleHostTopologyUpdater("SECONDARY_NAMENODE"));
+    hdfsSiteMap.put("dfs.namenode.secondary.http-address", new OptionalSingleHostTopologyUpdater("SECONDARY_NAMENODE"));
 
     // JOBTRACKER
     mapredSiteMap.put("mapred.job.tracker", new SingleHostTopologyUpdater("JOBTRACKER"));
@@ -2925,25 +2939,29 @@ public class BlueprintConfigurationProcessor {
     mapredSiteMap.put("mapreduce.job.hdfs-servers", new SingleHostTopologyUpdater("NAMENODE"));
 
 
-    // HISTORY_SERVER
-    yarnSiteMap.put("yarn.log.server.url", new SingleHostTopologyUpdater("HISTORYSERVER"));
-    mapredSiteMap.put("mapreduce.jobhistory.webapp.address", new SingleHostTopologyUpdater("HISTORYSERVER"));
-    mapredSiteMap.put("mapreduce.jobhistory.address", new SingleHostTopologyUpdater("HISTORYSERVER"));
+    // HISTORYSERVER
+    yarnSiteMap.put("yarn.log.server.url", new OptionalSingleHostTopologyUpdater("HISTORYSERVER"));
+    mapredSiteMap.put("mapreduce.jobhistory.webapp.address", new OptionalSingleHostTopologyUpdater("HISTORYSERVER"));
+    mapredSiteMap.put("mapreduce.jobhistory.address", new OptionalSingleHostTopologyUpdater("HISTORYSERVER"));
 
     // RESOURCEMANAGER
-    yarnSiteMap.put("yarn.resourcemanager.hostname", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
-    yarnSiteMap.put("yarn.resourcemanager.resource-tracker.address", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
-    yarnSiteMap.put("yarn.resourcemanager.webapp.address", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
-    yarnSiteMap.put("yarn.resourcemanager.scheduler.address", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
-    yarnSiteMap.put("yarn.resourcemanager.address", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
-    yarnSiteMap.put("yarn.resourcemanager.admin.address", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
-    yarnSiteMap.put("yarn.resourcemanager.webapp.https.address", new SingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.hostname", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.resource-tracker.address", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.webapp.address", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.scheduler.address", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.address", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.admin.address", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
+    yarnSiteMap.put("yarn.resourcemanager.webapp.https.address", new OptionalSingleHostTopologyUpdater("RESOURCEMANAGER"));
 
     // APP_TIMELINE_SERVER
-    yarnSiteMap.put("yarn.timeline-service.address", new SingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
-    yarnSiteMap.put("yarn.timeline-service.webapp.address", new SingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
-    yarnSiteMap.put("yarn.timeline-service.webapp.https.address", new SingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
-    yarnSiteMap.put("yarn.log.server.web-service.url", new SingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
+    yarnSiteMap.put("yarn.timeline-service.address", new OptionalSingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
+    yarnSiteMap.put("yarn.timeline-service.webapp.address", new OptionalSingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
+    yarnSiteMap.put("yarn.timeline-service.webapp.https.address", new OptionalSingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
+    yarnSiteMap.put("yarn.log.server.web-service.url", new OptionalSingleHostTopologyUpdater("APP_TIMELINE_SERVER"));
+
+    // TIMELINE_READER
+    yarnSiteMap.put("yarn.timeline-service.reader.webapp.address", new MultipleHostTopologyUpdater("TIMELINE_READER"));
+    yarnSiteMap.put("yarn.timeline-service.reader.webapp.https.address", new MultipleHostTopologyUpdater("TIMELINE_READER"));
 
     // HIVE_SERVER
     hiveSiteMap.put("hive.server2.authentication.ldap.url", new SingleHostTopologyUpdater("HIVE_SERVER2"));
@@ -3153,7 +3171,8 @@ public class BlueprintConfigurationProcessor {
     multiOozieSiteMap.put("oozie.service.ProxyUserService.proxyuser.knox.hosts", new MultipleHostTopologyUpdater("KNOX_GATEWAY"));
 
     // ATLAS
-    atlasPropsMap.put("atlas.server.bind.address", new SingleHostTopologyUpdater("ATLAS_SERVER"));
+    atlasPropsMap.put("atlas.server.bind.address", new MultipleHostTopologyUpdater("ATLAS_SERVER"));
+    atlasPropsMap.put("atlas.rest.address", new MultipleHostTopologyUpdater("ATLAS_SERVER", ',', true, true, true));
     atlasPropsMap.put("atlas.kafka.bootstrap.servers", new MultipleHostTopologyUpdater("KAFKA_BROKER"));
     atlasPropsMap.put("atlas.kafka.zookeeper.connect", new MultipleHostTopologyUpdater("ZOOKEEPER_SERVER"));
     atlasPropsMap.put("atlas.graph.index.search.solr.zookeeper-url", new MultipleHostTopologyUpdater("ZOOKEEPER_SERVER", ',', false, true, true));
@@ -3207,6 +3226,8 @@ public class BlueprintConfigurationProcessor {
     druidCommon.put("metastore_hostname", HostGroupUpdater.INSTANCE);
     druidCommon.put("druid.metadata.storage.connector.connectURI", HostGroupUpdater.INSTANCE);
     druidCommon.put("druid.zk.service.host", new MultipleHostTopologyUpdater("ZOOKEEPER_SERVER"));
+
+    livy2Conf.put("livy.server.recovery.state-store.url", new MultipleHostTopologyUpdater("ZOOKEEPER_SERVER"));
   }
 
   private static void addUnitPropertyUpdaters() {
@@ -3222,52 +3243,75 @@ public class BlueprintConfigurationProcessor {
     }
   }
 
-  private Collection<String> setupHDFSProxyUsers(Configuration configuration, Set<String> configTypesUpdated) {
-    // AMBARI-5206
-    final Map<String , String> userProps = new HashMap<>();
-
-    Collection<String> services = clusterTopology.getBlueprint().getServices();
-    if (services.contains("HDFS")) {
-      // only add user properties to the map for
-      // services actually included in the blueprint definition
-      if (services.contains("OOZIE")) {
-        userProps.put("oozie_user", "oozie-env");
-      }
-
-      if (services.contains("HIVE")) {
-        userProps.put("hive_user", "hive-env");
-        userProps.put("webhcat_user", "hive-env");
-      }
-
-      if (services.contains("HBASE")) {
-        userProps.put("hbase_user", "hbase-env");
-      }
-
-      if (services.contains("FALCON")) {
-        userProps.put("falcon_user", "falcon-env");
-      }
-
-      String proxyUserHosts = "hadoop.proxyuser.%s.hosts";
-      String proxyUserGroups = "hadoop.proxyuser.%s.groups";
-
-      Map<String, Map<String, String>> existingProperties = configuration.getFullProperties();
-      for (String property : userProps.keySet()) {
-        String configType = userProps.get(property);
-        Map<String, String> configs = existingProperties.get(configType);
-        if (configs != null) {
-          String user = configs.get(property);
-          if (user != null && !user.isEmpty()) {
-            ensureProperty(configuration, "core-site", String.format(proxyUserHosts, user), "*", configTypesUpdated);
-            ensureProperty(configuration, "core-site", String.format(proxyUserGroups, user), "*", configTypesUpdated);
-          }
-        } else {
-          LOG.debug("setMissingConfigurations: no user configuration found for type = {}.  This may be caused by an error in the blueprint configuration.",
-            configType);
+  /**
+   * Generates property names of the format "hadoop.proxyuser.*" based on actual usernames defined in {@code configuration}.
+   * Eg. if "hive-env" defined "hive_user": "cstm-hive", then a generated property name would be "hadoop_proxyuser_cstm-hive_hosts"
+   * @return set of hadoop proxyuser property names, paired with the name of the config type the username is defined in
+   *         (the config type is needed for filtering later)
+   */
+  private static Set<Pair<String, String>> generateHadoopProxyUserPropertyNames(Configuration configuration) {
+    Set<Pair<String, String>> proxyUsers = new HashSet<>();
+    Map<String, Map<String, String>> existingProperties = configuration.getFullProperties();
+    for (Pair<String, String> userProp : PROPERTIES_FOR_HADOOP_PROXYUSER) {
+      String configType = userProp.getLeft();
+      String property = userProp.getRight();
+      Map<String, String> configs = existingProperties.get(configType);
+      if (configs != null) {
+        String user = configs.get(property);
+        if (!Strings.isNullOrEmpty(user)) {
+          proxyUsers.add(Pair.of(configType, String.format(HADOOP_PROXYUSER_HOSTS_FORMAT, user)));
+          proxyUsers.add(Pair.of(configType, String.format(HADOOP_PROXYUSER_GROUPS_FORMAT, user)));
         }
-
       }
     }
-    return services;
+
+    return proxyUsers;
+  }
+
+  /**
+   * Ensures {@code hadoop.proxyuser.*} properties are present in core-site for the services defined in the blueprint.
+   */
+  private static void setupHDFSProxyUsers(Configuration configuration, Set<String> configTypesUpdated, Collection<String> services) {
+    if (services.contains("HDFS")) {
+      Set<Pair<String, String>> configTypePropertyPairs = generateHadoopProxyUserPropertyNames(configuration);
+      Set<String> acceptableConfigTypes = getEligibleConfigTypesForHadoopProxyUsers(services);
+
+      Map<String, Map<String, String>> existingProperties = configuration.getFullProperties();
+      for (Pair<String, String> pair : configTypePropertyPairs) {
+        String configType = pair.getLeft();
+        if (acceptableConfigTypes.contains(configType)) {
+          Map<String, String> configs = existingProperties.get(configType);
+          if (configs != null) {
+            ensureProperty(configuration, "core-site", pair.getRight(), "*", configTypesUpdated);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * @return set of config types with eligible properties for hadoop proxyuser
+   */
+  private static Set<String> getEligibleConfigTypesForHadoopProxyUsers(Collection<String> services) {
+    Set<String> acceptableConfigTypes = new HashSet<>();
+
+    if (services.contains("OOZIE")) {
+      acceptableConfigTypes.add("oozie-env");
+    }
+
+    if (services.contains("HIVE")) {
+      acceptableConfigTypes.add("hive-env");
+    }
+
+    if (services.contains("HBASE")) {
+      acceptableConfigTypes.add("hbase-env");
+    }
+
+    if (services.contains("FALCON")) {
+      acceptableConfigTypes.add("falcon-env");
+    }
+
+    return acceptableConfigTypes;
   }
 
   /**
@@ -3372,7 +3416,7 @@ public class BlueprintConfigurationProcessor {
    *          to this).
    * @throws ConfigurationTopologyException
    */
-  private void setStackToolsAndFeatures(Configuration configuration, Set<String> configTypesUpdated)
+  protected void setStackToolsAndFeatures(Configuration configuration, Set<String> configTypesUpdated)
     throws ConfigurationTopologyException {
     ConfigHelper configHelper = clusterTopology.getAmbariContext().getConfigHelper();
     Stack stack = clusterTopology.getBlueprint().getStack();
@@ -3381,8 +3425,10 @@ public class BlueprintConfigurationProcessor {
 
     StackId stackId = new StackId(stackName, stackVersion);
 
-    Set<String> properties = Sets.newHashSet(ConfigHelper.CLUSTER_ENV_STACK_NAME_PROPERTY,
-      ConfigHelper.CLUSTER_ENV_STACK_ROOT_PROPERTY, ConfigHelper.CLUSTER_ENV_STACK_TOOLS_PROPERTY,
+    Set<String> properties = Sets.newHashSet(
+      ConfigHelper.CLUSTER_ENV_STACK_NAME_PROPERTY,
+      ConfigHelper.CLUSTER_ENV_STACK_ROOT_PROPERTY,
+      ConfigHelper.CLUSTER_ENV_STACK_TOOLS_PROPERTY,
       ConfigHelper.CLUSTER_ENV_STACK_FEATURES_PROPERTY,
       ConfigHelper.CLUSTER_ENV_STACK_PACKAGES_PROPERTY);
 
@@ -3392,16 +3438,41 @@ public class BlueprintConfigurationProcessor {
 
       for( String property : properties ){
         if (clusterEnvDefaultProperties.containsKey(property)) {
-          configuration.setProperty(CLUSTER_ENV_CONFIG_TYPE_NAME, property,
-            clusterEnvDefaultProperties.get(property));
-
-          // make sure to include the configuration type as being updated
-          configTypesUpdated.add(CLUSTER_ENV_CONFIG_TYPE_NAME);
+          String newValue = clusterEnvDefaultProperties.get(property);
+          String previous = configuration.setProperty(CLUSTER_ENV_CONFIG_TYPE_NAME, property, newValue);
+          if (!Objects.equals(
+            trimValue(previous, stack, CLUSTER_ENV_CONFIG_TYPE_NAME, property),
+            trimValue(newValue, stack, CLUSTER_ENV_CONFIG_TYPE_NAME, property))) {
+            // in case a property is updated make sure to include cluster-env as being updated
+            configTypesUpdated.add(CLUSTER_ENV_CONFIG_TYPE_NAME);
+          }
         }
       }
     } catch( AmbariException ambariException ){
       throw new ConfigurationTopologyException("Unable to retrieve the stack tools and features",
         ambariException);
+    }
+  }
+
+  /**
+   * Ensures that properties non-stack properties are present in {@code configuration}.
+   */
+  private static void injectDefaults(Configuration configuration, Set<String> configTypesUpdated, Collection<String> services) {
+    setRetryConfiguration(configuration, configTypesUpdated);
+    setupHDFSProxyUsers(configuration, configTypesUpdated, services);
+  }
+
+  private @Nullable String trimValue(@Nullable String value,
+                                     @NotNull Stack stack,
+                                     @NotNull String configType,
+                                     @NotNull String propertyName) {
+    if (null == value) {
+      return null;
+    }
+    else {
+      TrimmingStrategy trimmingStrategy =
+        PropertyValueTrimmingStrategyDefiner.defineTrimmingStrategy(stack, propertyName, configType);
+      return trimmingStrategy.trim(value);
     }
   }
 
@@ -3414,7 +3485,7 @@ public class BlueprintConfigurationProcessor {
    * @param property       property name
    * @param defaultValue   default value
    */
-  private void ensureProperty(Configuration configuration, String type, String property, String defaultValue, Set<String> configTypesUpdated) {
+  private static void ensureProperty(Configuration configuration, String type, String property, String defaultValue, Set<String> configTypesUpdated) {
     if (configuration.getPropertyValue(type, property) == null) {
       configuration.setProperty(type, property, defaultValue);
       configTypesUpdated.add(type);
@@ -3478,6 +3549,7 @@ public class BlueprintConfigurationProcessor {
       return !PASSWORD_NAME_REGEX.matcher(propertyName).matches();
     }
   }
+
   /**
    * A Filter that excludes properties if in stack a property is marked as password property or kerberos principal
    *

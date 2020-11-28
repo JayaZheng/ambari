@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.apache.ambari.annotations.Experimental;
 import org.apache.ambari.annotations.ExperimentalFeature;
@@ -44,6 +45,7 @@ import org.apache.ambari.server.actionmanager.Stage;
 import org.apache.ambari.server.actionmanager.StageFactory;
 import org.apache.ambari.server.agent.ExecutionCommand.KeyNames;
 import org.apache.ambari.server.api.services.AmbariMetaInfo;
+import org.apache.ambari.server.cleanup.ClasspathScannerUtils;
 import org.apache.ambari.server.configuration.Configuration;
 import org.apache.ambari.server.controller.ActionExecutionContext;
 import org.apache.ambari.server.controller.AmbariActionExecutionHelper;
@@ -52,6 +54,7 @@ import org.apache.ambari.server.controller.AmbariManagementController;
 import org.apache.ambari.server.controller.ExecuteCommandJson;
 import org.apache.ambari.server.controller.KerberosHelper;
 import org.apache.ambari.server.controller.KerberosHelperImpl.SupportedCustomOperation;
+import org.apache.ambari.server.controller.UpdateConfigurationPolicy;
 import org.apache.ambari.server.controller.spi.NoSuchParentResourceException;
 import org.apache.ambari.server.controller.spi.NoSuchResourceException;
 import org.apache.ambari.server.controller.spi.Predicate;
@@ -80,32 +83,36 @@ import org.apache.ambari.server.security.authorization.AuthorizationException;
 import org.apache.ambari.server.security.authorization.AuthorizationHelper;
 import org.apache.ambari.server.security.authorization.ResourceType;
 import org.apache.ambari.server.security.authorization.RoleAuthorization;
+import org.apache.ambari.server.serveraction.ServerAction;
 import org.apache.ambari.server.serveraction.kerberos.KerberosOperationException;
+import org.apache.ambari.server.serveraction.upgrades.PluginUpgradeServerAction;
+import org.apache.ambari.server.stack.upgrade.AddComponentTask;
+import org.apache.ambari.server.stack.upgrade.ConfigUpgradePack;
+import org.apache.ambari.server.stack.upgrade.ConfigureTask;
+import org.apache.ambari.server.stack.upgrade.CreateAndConfigureTask;
+import org.apache.ambari.server.stack.upgrade.Direction;
+import org.apache.ambari.server.stack.upgrade.ManualTask;
+import org.apache.ambari.server.stack.upgrade.ServerSideActionTask;
+import org.apache.ambari.server.stack.upgrade.Task;
+import org.apache.ambari.server.stack.upgrade.UpdateStackGrouping;
+import org.apache.ambari.server.stack.upgrade.UpgradePack;
+import org.apache.ambari.server.stack.upgrade.UpgradeScope;
+import org.apache.ambari.server.stack.upgrade.orchestrate.StageWrapper;
+import org.apache.ambari.server.stack.upgrade.orchestrate.TaskWrapper;
+import org.apache.ambari.server.stack.upgrade.orchestrate.UpgradeContext;
+import org.apache.ambari.server.stack.upgrade.orchestrate.UpgradeContextFactory;
+import org.apache.ambari.server.stack.upgrade.orchestrate.UpgradeGroupHolder;
+import org.apache.ambari.server.stack.upgrade.orchestrate.UpgradeHelper;
 import org.apache.ambari.server.state.Cluster;
 import org.apache.ambari.server.state.Clusters;
 import org.apache.ambari.server.state.ConfigHelper;
 import org.apache.ambari.server.state.Service;
 import org.apache.ambari.server.state.ServiceComponent;
 import org.apache.ambari.server.state.StackId;
-import org.apache.ambari.server.state.UpgradeContext;
-import org.apache.ambari.server.state.UpgradeContextFactory;
-import org.apache.ambari.server.state.UpgradeHelper;
-import org.apache.ambari.server.state.UpgradeHelper.UpgradeGroupHolder;
-import org.apache.ambari.server.state.stack.ConfigUpgradePack;
-import org.apache.ambari.server.state.stack.UpgradePack;
-import org.apache.ambari.server.state.stack.upgrade.AddComponentTask;
-import org.apache.ambari.server.state.stack.upgrade.ConfigureTask;
-import org.apache.ambari.server.state.stack.upgrade.CreateAndConfigureTask;
-import org.apache.ambari.server.state.stack.upgrade.Direction;
-import org.apache.ambari.server.state.stack.upgrade.ManualTask;
-import org.apache.ambari.server.state.stack.upgrade.ServerSideActionTask;
-import org.apache.ambari.server.state.stack.upgrade.StageWrapper;
-import org.apache.ambari.server.state.stack.upgrade.Task;
-import org.apache.ambari.server.state.stack.upgrade.TaskWrapper;
-import org.apache.ambari.server.state.stack.upgrade.UpdateStackGrouping;
-import org.apache.ambari.server.state.stack.upgrade.UpgradeScope;
-import org.apache.ambari.server.state.stack.upgrade.UpgradeType;
+import org.apache.ambari.server.state.StackInfo;
 import org.apache.ambari.server.state.svccomphost.ServiceComponentHostServerActionEvent;
+import org.apache.ambari.spi.upgrade.UpgradeAction;
+import org.apache.ambari.spi.upgrade.UpgradeType;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang.StringUtils;
 import org.codehaus.jackson.annotate.JsonProperty;
@@ -213,7 +220,7 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
   private static final Map<Resource.Type, String> KEY_PROPERTY_IDS = new HashMap<>();
 
   @Inject
-  protected static UpgradeDAO s_upgradeDAO = null;
+  static UpgradeDAO s_upgradeDAO;
 
   @Inject
   private static Provider<AmbariMetaInfo> s_metaProvider = null;
@@ -759,6 +766,7 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
     upgrade.setClusterId(cluster.getClusterId());
     upgrade.setDirection(direction);
     upgrade.setUpgradePackage(pack.getName());
+    upgrade.setUpgradePackStackId(pack.getOwnerStackId());
     upgrade.setUpgradeType(pack.getType());
     upgrade.setAutoSkipComponentFailures(upgradeContext.isComponentFailureAutoSkipped());
     upgrade.setAutoSkipServiceCheckFailures(upgradeContext.isServiceCheckFailureAutoSkipped());
@@ -857,6 +865,7 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
               Map<String, String> requestProperties = new HashMap<>();
               requestProperties.put(SupportedCustomOperation.REGENERATE_KEYTABS.name().toLowerCase(), "missing");
               requestProperties.put(KerberosHelper.ALLOW_RETRY, Boolean.TRUE.toString().toLowerCase());
+              requestProperties.put(KerberosHelper.DIRECTIVE_CONFIG_UPDATE_POLICY, UpdateConfigurationPolicy.NEW_AND_IDENTITIES.name());
 
               // add stages to the upgrade which will regenerate missing keytabs only
               req = s_kerberosHelper.get().executeCustomOperations(cluster, requestProperties, req, null);
@@ -1233,7 +1242,8 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
     List<RequestResourceFilter> filters = new ArrayList<>();
 
     for (TaskWrapper tw : wrapper.getTasks()) {
-      filters.add(new RequestResourceFilter(tw.getService(), "", Collections.emptyList()));
+      List<String> hosts = tw.getHosts().stream().collect(Collectors.toList());
+      filters.add(new RequestResourceFilter(tw.getService(), "", hosts));
     }
 
     Cluster cluster = context.getCluster();
@@ -1246,6 +1256,7 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
     ActionExecutionContext actionContext = buildActionExecutionContext(cluster, context,
         "SERVICE_CHECK", stackId, filters, commandParams, allowRetry,
         wrapper.getMaxTimeout(s_configuration));
+    actionContext.setAutoSkipFailures(context.isServiceCheckFailureAutoSkipped());
 
     ExecuteCommandJson jsons = s_commandExecutionHelper.get().getCommandJson(actionContext,
         cluster, stackId, null);
@@ -1272,14 +1283,31 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
   }
 
   /**
-   * Creates a stage consisting of server side actions
-   * @param context upgrade context
-   * @param request upgrade request
-   * @param entity a single of upgrade
-   * @param task server-side task (if any)
-   * @param configUpgradePack a runtime-generated config upgrade pack that
-   * contains all config change definitions from all stacks involved into
-   * upgrade
+   * Creates a stage consisting of server side actions. If the server action is
+   * a {@link ServerAction} instance, then it will schedule it after verifying
+   * that the class can be loaded. If the action is an {@link UpgradeAction},
+   * then it will be scheduled as a {@link PluginUpgradeServerAction}.
+   *
+   * @param group
+   *          the upgrade group
+   * @param context
+   *          the upgrade context containing all of the information about the
+   *          upgrade.
+   * @param stackId
+   *          the ID of the stack that this stage is being created for. In some
+   *          upgrades, the stack ID changes part way through, such as during an
+   *          express upgrade.
+   * @param request
+   *          the request being constructed, but not yet persisted.
+   * @param entity
+   *          the upgrade item entity associated with the stage.
+   * @param task
+   *          the task from the upgrade pack XML which this command is being
+   *          built for.
+   * @param configUpgradePack
+   *          the configuration changes for the upgrade.
+   * @return {@code true} if the stage creation was successful, or {@code false}
+   *         if no processing was performed.
    * @throws AmbariException
    */
   private boolean makeServerSideStage(UpgradeGroupHolder group, UpgradeContext context,
@@ -1442,7 +1470,38 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
 
     Map<String, String> taskParameters = task.getParameters();
     commandParams.putAll(taskParameters);
-    stage.addServerActionCommand(task.getImplementationClass(),
+
+    // attempt to get a classloader from the stack (for plugins), and if there
+    // is not one, then default to Ambari's classloader
+    StackInfo stackInfo = s_metaProvider.get().getStack(stackId);
+    ClassLoader classLoader = stackInfo.getLibraryClassLoader();
+    if (null == classLoader) {
+      classLoader = ClasspathScannerUtils.class.getClassLoader();
+    }
+
+    // try to figure out what the class is so it can be scheduled correctly
+    final String classToSchedule;
+    String taskClass = task.getImplementationClass();
+    try {
+      Class<?> clazz = classLoader.loadClass(taskClass);
+      if (UpgradeAction.class.isAssignableFrom(clazz)) {
+        // upgrade actions are scheduled using our own server action, passing
+        // the name of the upgrade action in via the command params
+        classToSchedule = PluginUpgradeServerAction.class.getName();
+        commandParams.put(ServerAction.WRAPPED_CLASS_NAME, taskClass);
+      } else if (ServerAction.class.isAssignableFrom(clazz)) {
+        classToSchedule = task.getImplementationClass();
+      } else {
+        throw new AmbariException("The class " + taskClass
+            + " was not able to be scheduled during the upgrade because it is not compatible");
+      }
+    } catch (ClassNotFoundException cnfe) {
+      LOG.error("Unable to load {} specified in the upgrade pack", taskClass, cnfe);
+      throw new AmbariException("The class " + taskClass
+          + " was not able to be scheduled during the upgrade because it was not found");
+    }
+
+    stage.addServerActionCommand(classToSchedule,
         getManagementController().getAuthName(), Role.AMBARI_SERVER_ACTION, RoleCommand.EXECUTE,
         cluster.getClusterName(),
         new ServiceComponentHostServerActionEvent(null, System.currentTimeMillis()), commandParams,
@@ -1555,8 +1614,12 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
 
     } else if (status == HostRoleStatus.PENDING) {
       List<Long> taskIds = new ArrayList<>();
+
+      // pull back only ABORTED tasks in order to set them to PENDING - other
+      // status (such as TIMEDOUT and FAILED) must remain since they are
+      // considered to have been completed
       List<HostRoleCommandEntity> hrcEntities = s_hostRoleCommandDAO.findByRequestIdAndStatuses(
-          requestId, Sets.newHashSet(HostRoleStatus.ABORTED, HostRoleStatus.TIMEDOUT));
+          requestId, Sets.newHashSet(HostRoleStatus.ABORTED));
 
       for (HostRoleCommandEntity hrcEntity : hrcEntities) {
         taskIds.add(hrcEntity.getTaskId());
@@ -1596,12 +1659,12 @@ public class UpgradeResourceProvider extends AbstractControllerResourceProvider 
 
         // depending on whether this is an upgrade or a downgrade, the history
         // will be different
-        if (upgradeContext.getDirection() == Direction.UPGRADE || upgradeContext.isPatchRevert()) {
+        if (upgradeContext.getDirection() == Direction.UPGRADE) {
           history.setFromRepositoryVersion(component.getDesiredRepositoryVersion());
           history.setTargetRepositoryVersion(upgradeContext.getRepositoryVersion());
         } else {
           // the target version on a downgrade is the original version that the
-          // service was on in the failed upgrade
+          // service was on in the upgrade
           RepositoryVersionEntity targetRepositoryVersion = upgradeContext.getTargetRepositoryVersion(
               serviceName);
 

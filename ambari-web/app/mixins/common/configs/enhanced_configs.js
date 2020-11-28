@@ -71,8 +71,36 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
   currentlyChangedConfig: null,
 
   dependenciesGroupMessage: Em.I18n.t('popup.dependent.configs.dependencies.for.groups'),
+
   /**
-   * message fro alert box for dependent configs
+   * ConfigType-Widget map
+   * key - widget type
+   * value - widget view
+   * @type {object}
+   */
+  widgetTypeMap: {
+    checkbox: 'CheckboxConfigWidgetView',
+    combo: 'ComboConfigWidgetView',
+    directory: 'TextFieldConfigWidgetView',
+    directories: 'DirectoryConfigWidgetView',
+    list: 'ListConfigWidgetView',
+    password: 'PasswordConfigWidgetView',
+    'radio-buttons': 'RadioButtonConfigWidgetView',
+    slider: 'SliderConfigWidgetView',
+    'text-field': 'TextFieldConfigWidgetView',
+    'time-interval-spinner': 'TimeIntervalSpinnerView',
+    toggle: 'ToggleConfigWidgetView',
+    'text-area': 'StringConfigWidgetView',
+    'label': 'LabelView',
+    'test-db-connection': 'TestDbConnectionWidgetView'
+  },
+
+  configNameWidgetMixinMap: {
+    num_llap_nodes: App.NumLlapNodesWidgetMixin
+  },
+
+  /**
+   * message for alert box for dependent configs
    * @type {string}
    */
   dependenciesMessage: function() {
@@ -193,11 +221,12 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
     var updateDependencies = Em.isArray(changedConfigs) && changedConfigs.length > 0;
     var stepConfigs = this.get('stepConfigs');
     var requiredTags = [];
+    const isAutoComplete = Boolean(this.get('isRecommendationsAutoComplete'));
 
     if (updateDependencies || Em.isNone(this.get('recommendationsConfigs'))) {
-      var recommendations = this.get('hostGroups');
-      var dataToSend = this.getConfigRecommendationsParams(updateDependencies, changedConfigs);
-      this.modifyRecommendationConfigGroups(recommendations);
+      var recommendations = isAutoComplete ? {} : this.get('hostGroups');
+      var dataToSend = this.getConfigRecommendationsParams(updateDependencies, changedConfigs, isAutoComplete);
+      this.modifyRecommendationConfigGroups(recommendations, isAutoComplete);
 
       if (!stepConfigs.someProperty('serviceName', 'MISC')) {
         requiredTags.push({site: 'cluster-env', serviceName: 'MISC'});
@@ -237,8 +266,16 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
    * @param stepConfigs
    */
   addRecommendationRequestParams: function(recommendations, dataToSend, stepConfigs) {
-    recommendations.blueprint.configurations = blueprintUtils.buildConfigsJSON(stepConfigs);
+    const isAutoComplete = Boolean(this.get('isRecommendationsAutoComplete'));
+    if (!isAutoComplete) {
+        recommendations.blueprint.configurations = blueprintUtils.buildConfigsJSON(stepConfigs);
+    }
     dataToSend.recommendations = recommendations;
+    dataToSend.serviceName = this.get('content.serviceName');
+    dataToSend.clusterId = App.get('clusterId');
+    dataToSend.autoComplete = String(isAutoComplete);
+    // configsResponse - tells server to return only configurations in recommendations call
+    dataToSend.configsResponse = String(isAutoComplete);
   },
 
   /**
@@ -261,12 +298,13 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
   /**
    *
    * @param {object} recommendations
+   * @param {boolean} isAutoComplete
    */
-  modifyRecommendationConfigGroups: function(recommendations) {
+  modifyRecommendationConfigGroups: function(recommendations, isAutoComplete) {
     var configGroup = this.get('selectedConfigGroup');
 
     if (configGroup && !configGroup.get('isDefault') && configGroup.get('hosts.length') > 0) {
-      recommendations.config_groups = [this.buildConfigGroupJSON(this.get('selectedService.configs'), configGroup)];
+      recommendations.config_groups = [this.buildConfigGroupJSON(this.get('selectedService.configs'), configGroup, isAutoComplete)];
     } else {
       delete recommendations.config_groups;
     }
@@ -276,13 +314,14 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
    *
    * @param {boolean} updateDependencies
    * @param {Array} changedConfigs
+   * @param {boolean} isAutoComplete
    * @returns {{recommend: string, hosts: *, services: *, changed_configurations: *}}
    */
-  getConfigRecommendationsParams: function(updateDependencies, changedConfigs) {
+  getConfigRecommendationsParams: function(updateDependencies, changedConfigs, isAutoComplete) {
     return {
       recommend: updateDependencies ? 'configuration-dependencies' : 'configurations',
-      hosts: this.get('hostNames'),
-      services: this.get('serviceNames'),
+      hosts: isAutoComplete ? undefined : this.get('hostNames'),
+      services: isAutoComplete ? undefined : this.get('serviceNames'),
       changed_configurations: updateDependencies ? changedConfigs : undefined
     };
   },
@@ -350,10 +389,16 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
    * generates JSON with config group info to send it for recommendations
    * @param configs
    * @param configGroup
+   * @param {boolean} isAutoComplete
    * @returns {{configurations: Object[], hosts: string[]}}
    */
-  buildConfigGroupJSON: function(configs, configGroup) {
+  buildConfigGroupJSON: function(configs, configGroup, isAutoComplete) {
     Em.assert('configGroup can\'t be null', configGroup);
+    if (isAutoComplete) {
+      return {
+        group_id: Number(configGroup.get('id'))
+      }
+    }
     var hosts = configGroup.get('hosts');
     var configurations = {};
     var overrides = configs.forEach(function(cp) {
@@ -368,7 +413,8 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
     });
     return {
       configurations: [configurations],
-      hosts: hosts
+      hosts: hosts,
+      group_id: Number(configGroup.get('id'))
     }
   },
 
@@ -600,33 +646,150 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
   },
 
   /**
-   * disable saving recommended value for current config
+   * disable saving recommended value for current config. Remove recommendation for useroverriden values
    * @param config
    * @param {boolean} saveRecommended
    * @method removeCurrentFromDependentList
    */
   removeCurrentFromDependentList: function (config, saveRecommended) {
-    var recommendation = this.getRecommendation(config.get('name'), config.get('filename'), config.get('group.name'));
-    if (recommendation) this.saveRecommendation(recommendation, saveRecommended);
+    let name = config.get('name'),
+      fileName = config.get('filename'),
+      group = config.get('group.name');
+    var recommendation = this.getRecommendation(name, fileName, group);
+    if (recommendation) {
+      if (config.get('didUserOverrideValue')) {
+        this.removeRecommendation(name, fileName, group);
+      } else {
+        this.saveRecommendation(recommendation, saveRecommended);
+      }
+    }
   },
 
   updateAttributesFromTheme: function (serviceName) {
-    const serviceConfigs = this.get('stepConfigs').findProperty('serviceName', serviceName).get('configs'),
-      configConditions = App.ThemeCondition.find().filter(condition => {
-        const dependentConfigName = condition.get('configName'),
-          dependentConfigFileName = condition.get('fileName'),
-          configsToDependOn = condition.getWithDefault('configs', []);
-        return serviceConfigs.some(serviceConfig => {
-          const serviceConfigName = Em.get(serviceConfig, 'name'),
-            serviceConfigFileName = Em.get(serviceConfig, 'filename');
-          return (serviceConfigName === dependentConfigName && serviceConfigFileName === dependentConfigFileName)
-            || configsToDependOn.some(config => {
-              const {configName, fileName} = config;
-              return serviceConfigName === configName && serviceConfigFileName === fileName;
+    this.prepareSectionsConfigProperties(serviceName);
+    const service = this.get('stepConfigs').findProperty('serviceName', serviceName);
+    if (service) {
+      const serviceConfigs = service.get('configs'),
+        configConditions = App.ThemeCondition.find().filter(condition => {
+          const dependentConfigName = condition.get('configName'),
+            dependentConfigFileName = condition.get('fileName'),
+            configsToDependOn = condition.getWithDefault('configs', []);
+          return serviceConfigs.some(serviceConfig => {
+            const serviceConfigName = Em.get(serviceConfig, 'name'),
+              serviceConfigFileName = Em.get(serviceConfig, 'filename');
+            return (serviceConfigName === dependentConfigName && serviceConfigFileName === dependentConfigFileName)
+              || configsToDependOn.some(config => {
+                const {configName, fileName} = config;
+                return serviceConfigName === configName && serviceConfigFileName === fileName;
+              });
+          });
+        });
+      this.updateAttributesFromConditions(configConditions, serviceConfigs, serviceName);
+    }
+  },
+
+  prepareSectionsConfigProperties: function (serviceName) {
+    const tabs = App.Tab.find().filterProperty('serviceName', serviceName);
+    tabs.forEach(tab => {
+      this.processTab(tab);
+      tab.get('sectionRows').forEach(row => {
+        row.forEach(section => {
+          section.get('subsectionRows').forEach(subRow => {
+            subRow.forEach(subsection => {
+              this.setConfigsToContainer(subsection);
+              subsection.get('subSectionTabs').forEach(subSectionTab => {
+                this.setConfigsToContainer(subSectionTab);
+              });
             });
+          });
         });
       });
-    this.updateAttributesFromConditions(configConditions, serviceConfigs, serviceName);
+    });
+  },
+
+  /**
+   * set {code} configs {code} array of subsection or subsection tab.
+   * Also correct widget should be used for each config (it's selected according to <code>widget.type</code> and
+   * <code>widgetTypeMap</code>). It may throw an error if needed widget can't be found in the <code>widgetTypeMap</code>
+   * @param containerObject
+   */
+  setConfigsToContainer: function (containerObject) {
+    containerObject.set('configs', []);
+
+    containerObject.get('configProperties').forEach(function (configId) {
+      const config = App.configsCollection.getConfig(configId);
+      if (Em.get(config, 'widgetType')) {
+        const stepConfig = this.get('stepConfigs').findProperty('serviceName', Em.get(config, 'serviceName'));
+        if (!stepConfig) return;
+
+        const configProperty = stepConfig.get('configs').findProperty('id', Em.get(config, 'id'));
+        if (!configProperty) return;
+
+        containerObject.get('configs').pushObject(configProperty);
+
+        const widget = this.getWidgetView(config);
+        Em.assert('Unknown config widget view for config ' + configProperty.get('id') + ' with type ' + Em.get(config, 'widgetType'), widget);
+
+        let additionalProperties = {
+          widget,
+          stackConfigProperty: config
+        };
+
+        const configConditions = App.ThemeCondition.find().filter(_configCondition => {
+          // Filter config condition depending on the value of another config
+          const conditionalConfigs = _configCondition.getWithDefault('configs', []).filterProperty('fileName', Em.get(config, 'filename')).filterProperty('configName', Em.get(config, 'name'));
+          // Filter config condition depending on the service existence or service state
+          const serviceConfigConditionFlag = ((_configCondition.get('configName') === Em.get(config, 'name')) && (_configCondition.get('fileName') === Em.get(config, 'filename')) && (_configCondition.get('resource') === 'service'));
+          let conditions;
+
+          if (serviceConfigConditionFlag) {
+            const configCondition = {
+              configName: _configCondition.get('configName'),
+              fileName: _configCondition.get('fileName')
+            };
+            conditions = conditionalConfigs.concat(configCondition)
+          } else {
+            conditions = conditionalConfigs;
+          }
+          return (conditions && conditions.length);
+        });
+
+        if (configConditions && configConditions.length) {
+          additionalProperties.configConditions = configConditions;
+        }
+
+        const configAction = App.ConfigAction.find().filterProperty('fileName', Em.get(config, 'filename')).findProperty('configName', Em.get(config, 'name'));
+
+        if (configAction) {
+          additionalProperties.configAction = configAction;
+        }
+
+        configProperty.setProperties(additionalProperties);
+
+        if (configProperty.get('overrides')) {
+          configProperty.get('overrides').setEach('stackConfigProperty', config);
+        }
+        if (configProperty.get('compareConfigs')) {
+          configProperty.get('compareConfigs').invoke('setProperties', {
+            isComparison: false,
+            stackConfigProperty: config
+          });
+        }
+      }
+    }, this);
+  },
+
+  /**
+   *
+   * @param {object} config
+   * @returns {Em.View}
+   */
+  getWidgetView: function (config) {
+    const configWidgetType = Em.get(config, 'widgetType'),
+      name = Em.get(config, 'name'),
+      mixin = this.get('configNameWidgetMixinMap')[name],
+      viewClass = App[this.get('widgetTypeMap')[configWidgetType]];
+    return Em.isNone(mixin) ? viewClass : viewClass.extend(mixin);
   },
 
   updateAttributesFromConditions: function (configConditions, serviceConfigs, serviceName) {
@@ -693,14 +856,55 @@ App.EnhancedConfigsMixin = Em.Mixin.create(App.ConfigWithOverrideRecommendationP
       if (valueAttributes && !Em.none(valueAttributes.visible)) {
         let themeResource;
         if (subsectionCondition.get('type') === 'subsection') {
-          themeResource = App.SubSection.find().findProperty('name', subsectionConditionName);
+          themeResource = App.SubSection.find().find(function (subsection) {
+            return subsection.get('name') === subsectionConditionName && subsectionCondition.get('themeName') === subsection.get('themeName');
+          });
         } else if (subsectionCondition.get('type') === 'subsectionTab') {
-          themeResource = App.SubSectionTab.find().findProperty('name', subsectionConditionName);
+          themeResource = App.SubSectionTab.find().find(function (subsectionTab) {
+            return subsectionTab.get('name') === subsectionConditionName && subsectionCondition.get('themeName') === subsectionTab.get('themeName');
+          });
         }
         themeResource.set('isHiddenByConfig', !valueAttributes.visible);
         themeResource.get('configs').setEach('hiddenBySection', !valueAttributes.visible);
         themeResource.get('configs').setEach('hiddenBySubSection', !valueAttributes.visible);
       }
     }
+  },
+
+  /**
+   * Data reordering before tabs rendering.
+   * Reorder all sections/subsections into rows based on their rowIndex
+   * @param tab
+   */
+  processTab: function (tab) {
+    // process sections
+    let sectionRows = [];
+    const sections = tab.get('sections');
+    for (let j = 0; j < sections.get('length'); j++) {
+      const section = sections.objectAt(j);
+      let sectionRow = sectionRows[section.get('rowIndex')];
+      if (!sectionRow) {
+        sectionRow = sectionRows[section.get('rowIndex')] = [];
+      }
+      sectionRow.push(section);
+
+      //process subsections
+      const subsections = section.get('subSections');
+      let subsectionRows = [];
+      for (let k = 0; k < subsections.get('length'); k++) {
+        const subsection = subsections.objectAt(k);
+        let subsectionRow = subsectionRows[subsection.get('rowIndex')];
+        if (!subsectionRow) {
+          subsectionRow = subsectionRows[subsection.get('rowIndex')] = [];
+        }
+        subsectionRow.push(subsection);
+        // leave a title gap if one of the subsection on the same row within the same section has title
+        if (subsection.get('displayName')) {
+          subsectionRow.hasTitleGap = true;
+        }
+      }
+      section.set('subsectionRows', subsectionRows);
+    }
+    tab.set('sectionRows', sectionRows);
   }
 });

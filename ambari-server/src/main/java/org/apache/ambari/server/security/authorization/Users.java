@@ -36,6 +36,7 @@ import org.apache.ambari.server.configuration.Configuration;
 import org.apache.ambari.server.hooks.HookContextFactory;
 import org.apache.ambari.server.hooks.HookService;
 import org.apache.ambari.server.ldap.domain.AmbariLdapConfiguration;
+import org.apache.ambari.server.ldap.service.AmbariLdapConfigurationProvider;
 import org.apache.ambari.server.orm.dao.GroupDAO;
 import org.apache.ambari.server.orm.dao.MemberDAO;
 import org.apache.ambari.server.orm.dao.PermissionDAO;
@@ -121,7 +122,7 @@ public class Users {
   private PasswordEncoder passwordEncoder;
 
   @Inject
-  protected AmbariLdapConfiguration ldapConfiguration;
+  protected AmbariLdapConfigurationProvider ldapConfigurationProvider;
 
   @Inject
   protected Configuration configuration;
@@ -309,11 +310,28 @@ public class Users {
     userDAO.create(userEntity);
 
     // execute user initialization hook if required ()
-    hookServiceProvider.get().execute(hookContextFactory.createUserHookContext(validatedUserName));
+    executeUserHook(validatedUserName);
 
     return userEntity;
   }
 
+  /**
+   * Triggers the post user creation hook, if enabled
+   *
+   * @param username the username of the user to process
+   */
+  public void executeUserHook(String username) {
+    hookServiceProvider.get().execute(hookContextFactory.createUserHookContext(username));
+  }
+
+  /**
+   * Triggers the post user creation hook, if enabled
+   *
+   * @param userGroupsMap a map of user names to relevant groups
+   */
+  public void executeUserHook(Map<String, Set<String>> userGroupsMap) {
+    hookServiceProvider.get().execute(hookContextFactory.createBatchUserHookContext(userGroupsMap));
+  }
 
   /**
    * Removes a user from the Ambari database.
@@ -896,9 +914,20 @@ public class Users {
 
   private void processLdapAdminGroupMappingRules(Set<MemberEntity> membershipsToCreate) {
 
+    if (membershipsToCreate.isEmpty()) {
+      LOG.debug("There are no new memberships for which to process administrator group mapping rules.");
+      return;
+    }
+
+    AmbariLdapConfiguration ldapConfiguration = ldapConfigurationProvider.get();
+    if (ldapConfiguration == null) {
+      LOG.warn("The LDAP configuration is not available - no administrator group mappings will be processed.");
+      return;
+    }
+
     String adminGroupMappings = ldapConfiguration.groupMappingRules();
-    if (Strings.isNullOrEmpty(adminGroupMappings) || membershipsToCreate.isEmpty()) {
-      LOG.info("Nothing to do. LDAP admin group mappings: {}, Memberships to handle: {}", adminGroupMappings, membershipsToCreate.size());
+    if (Strings.isNullOrEmpty(adminGroupMappings)) {
+      LOG.debug("There are no administrator group mappings to be processed.");
       return;
     }
 
@@ -1343,19 +1372,17 @@ public class Users {
     addAuthentication(userEntity,
         UserAuthenticationType.JWT,
         key,
-        new Validator() {
-          public void validate(UserEntity userEntity, String key) throws AmbariException {
-            List<UserAuthenticationEntity> authenticationEntities = userEntity.getAuthenticationEntities();
+            (user, authKey) -> {
+              List<UserAuthenticationEntity> authenticationEntities = user.getAuthenticationEntities();
 
-            // Ensure only one UserAuthenticationEntity exists for JWT for the user...
-            for (UserAuthenticationEntity entity : authenticationEntities) {
-              if ((entity.getAuthenticationType() == UserAuthenticationType.JWT) &&
-                  ((key == null) ? (entity.getAuthenticationKey() == null) : key.equals(entity.getAuthenticationKey()))) {
-                throw new AmbariException("The authentication type already exists for this user");
+              // Ensure only one UserAuthenticationEntity exists for JWT for the user...
+              for (UserAuthenticationEntity entity : authenticationEntities) {
+                if ((entity.getAuthenticationType() == UserAuthenticationType.JWT) &&
+                    ((authKey == null) ? (entity.getAuthenticationKey() == null) : authKey.equals(entity.getAuthenticationKey()))) {
+                  throw new AmbariException("The authentication type already exists for this user");
+                }
               }
-            }
-          }
-        },
+            },
         persist);
   }
 
@@ -1385,14 +1412,12 @@ public class Users {
     addAuthentication(userEntity,
         UserAuthenticationType.KERBEROS,
         principalName,
-        new Validator() {
-          public void validate(UserEntity userEntity, String key) throws AmbariException {
-            // Ensure no other authentication entries exist for the same principal...
-            if (!CollectionUtils.isEmpty(userAuthenticationDAO.findByTypeAndKey(UserAuthenticationType.KERBEROS, key))) {
-              throw new AmbariException("The authentication type already exists for this principal");
-            }
-          }
-        },
+            (user, key) -> {
+              // Ensure no other authentication entries exist for the same principal...
+              if (!CollectionUtils.isEmpty(userAuthenticationDAO.findByTypeAndKey(UserAuthenticationType.KERBEROS, key))) {
+                throw new AmbariException("The authentication type already exists for this principal");
+              }
+            },
         persist);
   }
 
@@ -1433,18 +1458,16 @@ public class Users {
     addAuthentication(userEntity,
         UserAuthenticationType.LOCAL,
         encodedPassword,
-        new Validator() {
-          public void validate(UserEntity userEntity, String key) throws AmbariException {
-            List<UserAuthenticationEntity> authenticationEntities = userEntity.getAuthenticationEntities();
+            (user, key) -> {
+              List<UserAuthenticationEntity> authenticationEntities = user.getAuthenticationEntities();
 
-            // Ensure only one UserAuthenticationEntity exists for LOCAL for the user...
-            for (UserAuthenticationEntity entity : authenticationEntities) {
-              if (entity.getAuthenticationType() == UserAuthenticationType.LOCAL) {
-                throw new AmbariException("The authentication type already exists for this user");
+              // Ensure only one UserAuthenticationEntity exists for LOCAL for the user...
+              for (UserAuthenticationEntity entity : authenticationEntities) {
+                if (entity.getAuthenticationType() == UserAuthenticationType.LOCAL) {
+                  throw new AmbariException("The authentication type already exists for this user");
+                }
               }
-            }
-          }
-        },
+            },
         persist);
   }
 
@@ -1474,18 +1497,16 @@ public class Users {
     addAuthentication(userEntity,
         UserAuthenticationType.PAM,
         userName,
-        new Validator() {
-          public void validate(UserEntity userEntity, String key) throws AmbariException {
-            List<UserAuthenticationEntity> authenticationEntities = userEntity.getAuthenticationEntities();
+            (user, key) -> {
+              List<UserAuthenticationEntity> authenticationEntities = user.getAuthenticationEntities();
 
-            // Ensure only one UserAuthenticationEntity exists for PAM for the user...
-            for (UserAuthenticationEntity entity : authenticationEntities) {
-              if (entity.getAuthenticationType() == UserAuthenticationType.PAM) {
-                throw new AmbariException("The authentication type already exists for this user");
+              // Ensure only one UserAuthenticationEntity exists for PAM for the user...
+              for (UserAuthenticationEntity entity : authenticationEntities) {
+                if (entity.getAuthenticationType() == UserAuthenticationType.PAM) {
+                  throw new AmbariException("The authentication type already exists for this user");
+                }
               }
-            }
-          }
-        },
+            },
         persist);
   }
 
@@ -1515,19 +1536,17 @@ public class Users {
     addAuthentication(userEntity,
         UserAuthenticationType.LDAP,
         StringUtils.lowerCase(dn), // DNs are case-insensitive and are stored internally as the bytes of lowercase characters
-        new Validator() {
-          public void validate(UserEntity userEntity, String key) throws AmbariException {
-            List<UserAuthenticationEntity> authenticationEntities = userEntity.getAuthenticationEntities();
+            (user, key) -> {
+              List<UserAuthenticationEntity> authenticationEntities = user.getAuthenticationEntities();
 
-            // Ensure only one UserAuthenticationEntity exists for LDAP for the user...
-            for (UserAuthenticationEntity entity : authenticationEntities) {
-              if ((entity.getAuthenticationType() == UserAuthenticationType.LDAP) &&
-                  ((key == null) ? (entity.getAuthenticationKey() == null) : key.equalsIgnoreCase(entity.getAuthenticationKey()))) {
-                throw new AmbariException("The authentication type already exists for this user");
+              // Ensure only one UserAuthenticationEntity exists for LDAP for the user...
+              for (UserAuthenticationEntity entity : authenticationEntities) {
+                if ((entity.getAuthenticationType() == UserAuthenticationType.LDAP) &&
+                    ((key == null) ? (entity.getAuthenticationKey() == null) : key.equalsIgnoreCase(entity.getAuthenticationKey()))) {
+                  throw new AmbariException("The authentication type already exists for this user");
+                }
               }
-            }
-          }
-        },
+            },
         persist);
   }
 
